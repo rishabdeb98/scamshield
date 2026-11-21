@@ -6,10 +6,20 @@ import type {
   SampleMessage,
   ScamLibraryCategory,
 } from '../types/scamshield';
+import {
+  clearBrowserHistory,
+  deleteBrowserHistoryItem,
+  readBrowserAwareness,
+  readBrowserHistory,
+  recordBrowserExampleExplored,
+  recordBrowserQuizAttempt,
+  saveBrowserHistoryResult,
+} from '../utils/browserStorage';
 
 // Held strictly in JS memory (never localStorage/sessionStorage) so session
 // history stays consistent even when an embedded iframe blocks third-party cookies.
 let inMemorySessionToken: string | null = null;
+let isStatelessBackend = false;
 
 function buildHeaders(includeJsonContentType = false): Record<string, string> {
   const headers: Record<string, string> = {
@@ -24,12 +34,14 @@ function buildHeaders(includeJsonContentType = false): Record<string, string> {
   return headers;
 }
 
-async function parseJsonResponse<T>(res: Response): Promise<T> {
+async function parseJsonResponse<T>(
+  res: Response,
+): Promise<T & { mode?: string; sessionToken?: string }> {
   const raw = await res.text();
-  let data: (T & { error?: string; sessionToken?: string }) | null = null;
+  let data: (T & { error?: string; sessionToken?: string; mode?: string }) | null = null;
   if (raw) {
     try {
-      data = JSON.parse(raw) as T & { error?: string; sessionToken?: string };
+      data = JSON.parse(raw) as T & { error?: string; sessionToken?: string; mode?: string };
     } catch {
       data = null;
     }
@@ -43,6 +55,9 @@ async function parseJsonResponse<T>(res: Response): Promise<T> {
   }
   if (typeof data.sessionToken === 'string' && data.sessionToken.length > 0) {
     inMemorySessionToken = data.sessionToken;
+  }
+  if (data.mode === 'stateless') {
+    isStatelessBackend = true;
   }
   return data;
 }
@@ -65,6 +80,10 @@ export async function analyzeMessageApi(params: {
     body: JSON.stringify(params),
   });
   const data = await parseJsonResponse<{ result: AnalysisResult }>(res);
+  if ((data.mode === 'stateless' || isStatelessBackend) && params.saveToHistory !== false) {
+    const saved = saveBrowserHistoryResult(data.result);
+    return saved.result;
+  }
   return data.result;
 }
 
@@ -79,6 +98,10 @@ export async function analyzeUrlApi(params: {
     body: JSON.stringify(params),
   });
   const data = await parseJsonResponse<{ result: AnalysisResult }>(res);
+  if ((data.mode === 'stateless' || isStatelessBackend) && params.saveToHistory !== false) {
+    const saved = saveBrowserHistoryResult(data.result);
+    return saved.result;
+  }
   return data.result;
 }
 
@@ -88,6 +111,9 @@ export async function fetchHistoryApi(): Promise<HistoryItem[]> {
     credentials: 'include',
   });
   const data = await parseJsonResponse<{ items: HistoryItem[] }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    return readBrowserHistory();
+  }
   return data.items;
 }
 
@@ -97,7 +123,10 @@ export async function deleteHistoryItemApi(id: string): Promise<void> {
     headers: buildHeaders(false),
     credentials: 'include',
   });
-  await parseJsonResponse<{ deleted: boolean }>(res);
+  const data = await parseJsonResponse<{ deleted: boolean }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    deleteBrowserHistoryItem(id);
+  }
 }
 
 export async function clearHistoryApi(): Promise<void> {
@@ -106,7 +135,10 @@ export async function clearHistoryApi(): Promise<void> {
     headers: buildHeaders(false),
     credentials: 'include',
   });
-  await parseJsonResponse<{ cleared: boolean }>(res);
+  const data = await parseJsonResponse<{ cleared: boolean }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    clearBrowserHistory();
+  }
 }
 
 export async function fetchAwarenessApi(): Promise<AwarenessProgress> {
@@ -115,6 +147,9 @@ export async function fetchAwarenessApi(): Promise<AwarenessProgress> {
     credentials: 'include',
   });
   const data = await parseJsonResponse<{ progress: AwarenessProgress }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    return readBrowserAwareness();
+  }
   return data.progress;
 }
 
@@ -129,6 +164,9 @@ export async function recordExampleExploredApi(
     body: JSON.stringify({ exampleId, category }),
   });
   const data = await parseJsonResponse<{ progress: AwarenessProgress }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    return recordBrowserExampleExplored(exampleId, category);
+  }
   return data.progress;
 }
 
@@ -140,5 +178,8 @@ export async function recordQuizAttemptApi(score: number): Promise<AwarenessProg
     body: JSON.stringify({ score }),
   });
   const data = await parseJsonResponse<{ progress: AwarenessProgress }>(res);
+  if (data.mode === 'stateless' || isStatelessBackend) {
+    return recordBrowserQuizAttempt(score);
+  }
   return data.progress;
 }

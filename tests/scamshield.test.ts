@@ -661,3 +661,115 @@ test('Security hardening: headers, malformed JSON, strict CSRF, rate limit (429)
   }
 });
 
+test('Vercel stateless API handler and browser localStorage persistence work seamlessly', async () => {
+  const { createStatelessApiApp } = await import('../api/index.ts');
+  const {
+    BROWSER_AWARENESS_KEY,
+    BROWSER_HISTORY_KEY,
+    clearBrowserHistory,
+    deleteBrowserHistoryItem,
+    readBrowserAwareness,
+    readBrowserHistory,
+    recordBrowserExampleExplored,
+    recordBrowserQuizAttempt,
+    saveBrowserHistoryResult,
+  } = await import('../src/utils/browserStorage.ts');
+
+  const app = createStatelessApiApp();
+  const server = app.listen(0);
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  // In-memory mock StorageLike to test browser persistence cleanly
+  const store = new Map<string, string>();
+  const mockStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      store.set(key, value);
+    },
+    removeItem: (key: string) => {
+      store.delete(key);
+    },
+  };
+
+  try {
+    const healthRes = await fetch(`${baseUrl}/api/health`);
+    assert.equal(healthRes.status, 200);
+    const healthJson = (await healthRes.json()) as { status: string; mode: string };
+    assert.equal(healthJson.status, 'ok');
+    assert.equal(healthJson.mode, 'stateless');
+
+    // CSRF protection enforced
+    const csrfFail = await fetch(`${baseUrl}/api/analyze/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Test' }),
+    });
+    assert.equal(csrfFail.status, 403);
+
+    // Message scan returns stateless mode + redacted preview + UUID id
+    const msgRes = await fetch(`${baseUrl}/api/analyze/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'ScamShield' },
+      body: JSON.stringify({
+        message: 'URGENT: Call 9800012345 or visit http://sbi-kyc.example.com to unlock KYC',
+        channel: 'sms',
+        saveToHistory: true,
+      }),
+    });
+    assert.equal(msgRes.status, 200);
+    const msgData = (await msgRes.json()) as {
+      mode: string;
+      result: import('../src/types/scamshield.ts').AnalysisResult;
+    };
+    assert.equal(msgData.mode, 'stateless');
+    assert.ok(msgData.result.id);
+    assert.ok(!msgData.result.redactedPreview.includes('9800012345'));
+    assert.ok(msgData.result.score >= 60);
+
+    // Save into browser storage and verify history lifecycle
+    const saved = saveBrowserHistoryResult(msgData.result, mockStorage);
+    assert.equal(readBrowserHistory(mockStorage).length, 1);
+    assert.equal(readBrowserHistory(mockStorage)[0]?.id, saved.id);
+
+    const delApiRes = await fetch(`${baseUrl}/api/history/${saved.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Requested-With': 'ScamShield' },
+    });
+    assert.equal(delApiRes.status, 200);
+    deleteBrowserHistoryItem(saved.id, mockStorage);
+    assert.equal(readBrowserHistory(mockStorage).length, 0);
+
+    saveBrowserHistoryResult(msgData.result, mockStorage);
+    clearBrowserHistory(mockStorage);
+    assert.equal(readBrowserHistory(mockStorage).length, 0);
+
+    // Corrupt localStorage JSON recovers cleanly
+    store.set(BROWSER_HISTORY_KEY, '{not-valid-json');
+    assert.deepEqual(readBrowserHistory(mockStorage), []);
+    store.set(BROWSER_AWARENESS_KEY, 'corrupt');
+    assert.equal(readBrowserAwareness(mockStorage).quizAttempts, 0);
+
+    // Awareness tracking in browser storage + API validation
+    const quizBad = await fetch(`${baseUrl}/api/awareness/quiz`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'ScamShield' },
+      body: JSON.stringify({ score: 150 }),
+    });
+    assert.equal(quizBad.status, 400);
+
+    recordBrowserExampleExplored('bank-sbi-kyc', 'Banking', mockStorage);
+    const prog1 = recordBrowserQuizAttempt(70, mockStorage);
+    const prog2 = recordBrowserQuizAttempt(90, mockStorage);
+    assert.equal(prog1.bestQuizScore, 70);
+    assert.equal(prog2.quizAttempts, 2);
+    assert.equal(prog2.bestQuizScore, 90);
+    assert.deepEqual(prog2.exploredExampleIds, ['bank-sbi-kyc']);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+
